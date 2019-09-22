@@ -1,0 +1,165 @@
+#encoding:utf-8
+import os
+import sys
+import datetime
+import json
+import traceback
+from pyspark.sql.functions import *
+from pyspark.sql import Row
+import numpy as np
+import pandas as pd
+
+#sys.setdefaultencoding('utf-8')
+
+##getTime()
+def getTime():
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+##UDF
+##用lambda函数,不然会报错
+ugetTime = udf(lambda x : getTime())
+ugetNone = udf(lambda x :  None)
+
+
+##------map_function
+def map_getTime(x,end_time):
+
+    ret = x.asDict()
+    cur_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if not ret[end_time]:
+        ret[end_time] = cur_time
+    return Row(**ret)
+
+def getUpdateAllpdf(tar_df,subtr_df,key,list_date):
+
+    '''
+    parm说明：
+    sub_pdf 为源表和目标表差异的记录形成的DF
+    sub_df中的记录去tar_df中查找
+    如果查到,则更新tar_df中的end_date等于当前时间
+    查找的过程要制定ID,主键
+    '''
+    try:
+
+        #子集的记录可以在目标表中找到，同时目标表中的end_time的记录为空
+        tdf_edt_nna= tar_df.filter(col(list_date[1]).isNotNull())
+        ## tdf中end_time为空的数据
+        tdf_edt_na = tar_df.filter(col(list_date[1]).isNull())
+
+        ##tdf中end_time为空的数据,但是可以在subtr_pdf中找到的记录
+        tdf_edt_na_subset = tdf_edt_na.join(subtr_df,key,'left_semi')
+        #如果与tdf_edt_na的交集为空，直接追加到tar_df即可
+        if tdf_edt_na_subset.take(1):
+            tdf_edt_na_sub = tdf_edt_na_subset.rdd.map(lambda x:map_getTime(x,list_date[1])).toDF(sampleRatio=0.6)
+            #tdf中end_time为空的数据,但在sub_pdf中找不到的数据 tdf_edt_na_exp
+            tdf_edt_na_exp = tdf_edt_na.join(subtr_df,key,'left_anti')
+            #最后合并结果
+            upt_df_all = tdf_edt_nna.unionByName(tdf_edt_na_sub).unionByName(tdf_edt_na_exp).unionByName(subtr_df)
+
+        else:
+            upt_df_all = tar_df.unionByName(subtr_df)
+        #tdf_edt_na_sub =tdf_edt_na_sub_pre.rdd.map(lambda x:map_getTime(x,list_date[1])).toDF(sampleRatio=0.6)
+
+        #tdf_edt_na_sub.sort('ID',ascending = False).show(5)
+    except:
+        print("更新主程序异常，请查看")
+        traceback.print_exc()
+        exit(1)
+    else:
+        print("更新函数调用成功")
+
+    return upt_df_all
+
+##填充两个交集的DF
+##加入spark 这个入口函数
+def fixDatasdf(sur_spdf,tar_spdf,list_date):
+    '''
+    parm说明：两个spdf取交集,
+    并且填充日期字段
+    '''
+    #取源表与目标表的差集
+    try:
+
+        inst_df = sur_spdf.subtract(tar_spdf)
+        ##交集不为空
+        if inst_df.take(1):
+            return inst_df.select('*',date_format(current_timestamp(),'yyyy-MM-dd HH:mm:ss').alias(list_date[0]) \
+                                  ,lit(None).cast("string").alias(list_date[1]))
+        else:
+            ##退出
+            print("没有要更新的记录")
+            return
+    except:
+        print("填充程序出现异常，请查看")
+        exit(1)
+
+    else:
+        print("增量差集成功返回")
+
+##getSql_ext
+def getRestsdf(spark,table,list_date):
+    '''
+    parm说明：
+    获取table中剔除日期字段的SQL语句
+    '''
+    df = spark.table(table)
+    ##删除指定的列表
+    for i in list_date:
+        df = df.drop(i)
+    return df
+
+##组合得到最后的DF
+def getFinalDf(spark,sur_sdf,tar_table,key,list_date,flag=0):
+    '''
+    parm:spark为执行环境
+    sur_df为源sdf
+    tar_df为目标插入sdf
+    '''
+
+    #提前判断更新集合是否为空
+    tar_pre = getRestsdf(spark, tar_table, list_date)
+    upt_pre = fixDatasdf(sur_sdf, tar_pre, list_date)
+    ##如果更新的集合为空，直接退出程序
+    if upt_pre == None:
+        exit(0)
+    else:
+        #复制表数据
+        tar_copy_table = 'tdl_'+tar_table.split('.')[-1]
+        drop_sql ='drop table if exists {0}'.format(tar_copy_table)
+        copy_sql ='create table {0} lifecycle 1 as select * from {1}'.format(tar_copy_table,tar_table)
+        spark.sql(drop_sql)
+        spark.sql(copy_sql)
+        ##得到目标table sdf
+        tar_sdf = spark.table(tar_copy_table)
+        ##目标剔除start_date,end_date的tar_sdf
+        tar_sub_sdf = getRestsdf(spark,tar_copy_table,list_date)
+        ##得到源表与目标表的差集，并且补全日期字段
+        upt_sdf = fixDatasdf(sur_sdf,tar_sub_sdf,list_date)
+        
+        ##得到最后的sdf
+        ##可能插入的数据存在空值
+        final_sdf = getUpdateAllpdf(tar_sdf,upt_sdf,key,list_date)
+
+    return final_sdf
+
+
+
+###初始化目标表,将modify_time赋值给start_time,同时end_time数据置为空
+def init_tar_table(spark,tar_table,key,list_date):
+
+    #捕获目标表变化的操作之前，需要对目标表进行初始化
+
+    tar_sdf = spark.table(tar_table)
+    #获取目标SDF的字段列表
+    tar_col_set = set(tar_sdf.columns)
+
+    if tar_col_set > set(list_date):
+
+        tar_sdf = getRestsdf(spark,tar_table,list_date)
+        tar_sdf.select('*',ugetTime(key).alias(list_date[0]),ugetNone(key).alias(list_date[1])) \
+            .createOrReplaceTempView("tdl_tar_init_table")
+        sql_str ="insert overwrite table %s select * from tdl_tar_init_table" % tar_table
+        spark.sql(sql_str)
+    else:
+        #目标表没有添加start_time,end_time
+        print("请在目标表添加start_time,end_time")
+        exit(1)
